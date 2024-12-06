@@ -526,7 +526,6 @@ class Trainer:
 
     def train(self):
         self.model.train()
-        print(f'tokenizer size = {tokenizer.vocab_size}')
         epoch = 0
         pbar = tqdm(total=self.config["total_steps"], desc=f"Training Epoch {epoch}")
         print("Starting training...")
