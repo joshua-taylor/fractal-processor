@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Subset, Dataset, DataLoader
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from datasets import load_dataset
 import wandb
 import json
@@ -13,6 +13,7 @@ import random
 from datetime import datetime
 from collections import Counter
 import itertools
+from tokenizers import Tokenizer, models, pre_tokenizers, trainers, processors
 from transformers import LogitsProcessorList, MinLengthLogitsProcessor, RepetitionPenaltyLogitsProcessor
 
 class LSTMProcessor(nn.Module):
@@ -56,71 +57,88 @@ class LSTMProcessor(nn.Module):
 
 
 class TokenConnector(nn.Module):
-    def __init__(self, d_model, num_patterns=4):
+    def __init__(self, d_model, num_patterns=128):
         super().__init__()
         self.d_model = d_model
-        
+
         # Simple learned patterns for token relationships
         self.patterns = nn.Parameter(torch.randn(num_patterns, d_model) * 0.02)
-        
+
         # Lightweight scorer to identify important tokens
         self.scorer = nn.Linear(d_model, num_patterns)
-        
+
         # Simple mixing layer
         self.mixer = nn.Linear(d_model * 2, d_model)
-        
+
     def forward(self, x, causal_mask=None):
         B, L, D = x.shape
-        
+
+        # **Pattern-based representations**
         # Score each token's relationship to each pattern
         scores = self.scorer(x)  # [B, L, num_patterns]
-        
-        # Create causal mask for this sequence length if provided
         if causal_mask is None:
-            # Create mask of appropriate size
             mask = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
             scores = scores.masked_fill(mask[:L, :L].unsqueeze(-1), float('-inf'))
-        
         scores = F.softmax(scores, dim=-1)
-        
+
         # Create pattern-based representations
         pattern_mix = torch.einsum('bln,nd->bld', scores, self.patterns)
-        
-        # Combine original tokens with their pattern-based connections
-        output = self.mixer(torch.cat([x, pattern_mix], dim=-1))
-        
-        return output + x  # Add residual connection
+
+        # **Combine with Tokens**
+        # Combine tokens with pattern-based connections
+        combined = torch.cat([x, pattern_mix], dim=-1)
+        combined = self.mixer(combined)
+
+        return combined + x  # Add residual
+
 
 class CausalFractalProcessor(nn.Module):
-    def __init__(self, vocab_size, d_model, depth=3, window_size=32):
+    def __init__(self, vocab_size, d_model, depth=3, window_size=32, num_convolutions=3,
+                        use_embedding=True,
+                        use_convolutions=True,
+                        use_token_connectors=True,
+                        use_predictors=True,
+                        use_scale_mixer=True,
+                        use_pos_phases=True,):
         super().__init__()
         self.d_model = d_model
         self.depth = depth
         self.window_size = window_size
-        
-        # Add embedding layer
+
+        # Store the toggles
+        self.use_embedding = use_embedding
+        self.use_convolutions = use_convolutions
+        self.use_token_connectors = use_token_connectors
+        self.use_predictors = use_predictors
+        self.use_scale_mixer = use_scale_mixer
+        self.use_pos_phases = use_pos_phases
+        # Embedding layer
         self.embedding = nn.Embedding(vocab_size, d_model)
         
-        # Progressive window sizes for each level
+        # Progressive window sizes and dilations
         self.windows = [window_size * (2**i) for i in range(depth)]
+        self.dilations = [i+1 for i in range(depth)]
         
-        # Causal convolutions for each scale
+        # Causal convolutions
         self.causal_convs = nn.ModuleList([
-            nn.Conv1d(
-                d_model, 
-                d_model, 
-                kernel_size=max(7, window),
-                padding=0,  # No padding - maintain causality
-                groups=d_model  # Depthwise for efficiency
-            ) for window in self.windows
+            nn.ModuleList([
+                nn.Conv1d(
+                    d_model, 
+                    d_model, 
+                    kernel_size=max(7, window),
+                    padding=0,  # No padding to maintain causality
+                    dilation=self.dilations[i], 
+                    groups=d_model
+                ) for _ in range(num_convolutions)
+            ]) for i, window in enumerate(self.windows)
         ])
         
-        # Add token connectors for each scale
+        # Token connectors
         self.token_connectors = nn.ModuleList([
             TokenConnector(d_model) for _ in range(depth)
         ])
         
-        # Future-prediction modules
+        # Predictors
         self.predictors = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(d_model, d_model * 4),
@@ -129,19 +147,18 @@ class CausalFractalProcessor(nn.Module):
             ) for _ in range(depth)
         ])
         
-        # Scale mixing with causal constraint
+        # Scale mixer
         self.scale_mixer = nn.ModuleList([
             nn.Linear(d_model * (i + 1), d_model)
             for i in range(depth)
         ])
         
-        # Learned positional phases
+        # Positional phases
         self.pos_phases = nn.Parameter(torch.randn(depth, d_model) * 0.02)
         
-        # Layer normalization for better stability
+        # Layer norms
         self.layer_norms = nn.ModuleList([
-            nn.LayerNorm(d_model)
-            for _ in range(depth)
+            nn.LayerNorm(d_model) for _ in range(depth)
         ])
         
         # Output projection to vocabulary
@@ -152,78 +169,91 @@ class CausalFractalProcessor(nn.Module):
         )
 
     def _apply_causal_padding(self, x, conv):
-        # Apply causal padding based on kernel size
-        pad_size = conv.kernel_size[0] - 1
+        pad_size = (conv.kernel_size[0] - 1) * conv.dilation[0]
         return F.pad(x, (pad_size, 0))
 
-    def forward(self, x):
-        # x shape: [batch_size, sequence_length]
+    def forward(self, x, use_embedding=True, use_convolutions=True, 
+                use_token_connectors=True, use_predictors=True, 
+                use_scale_mixer=True, use_pos_phases=True):
         B, L = x.shape
-        
-        # Convert tokens to embeddings
-        x = self.embedding(x)  # shape: [batch_size, sequence_length, d_model]
-        
+
+        # Embedding or one-hot representation
+        if use_embedding:
+            x = self.embedding(x)  # [B, L, d_model]
+        else:
+            x = F.one_hot(x, num_classes=self.d_model).float()
+
         outputs = []
         current_features = x
-        
-        # Create causal mask once for all token connectors
         causal_mask = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
-        
-        # Process each scale causally
+
         for i in range(self.depth):
-            # Add positional information using phases
-            pos = torch.arange(L, device=x.device)[:, None] * self.pos_phases[i][None, :]
-            scale_input = current_features * (1 + pos.sin()) + pos.cos()
-            
-            # Apply layer normalization
+            scale_input = current_features
+
+            # Add positional information if enabled
+            if use_pos_phases:
+                pos = torch.arange(L, device=x.device)[:, None] * self.pos_phases[i][None, :]
+                scale_input = scale_input * (1 + pos.sin()) + pos.cos()
+
+            # Layer normalization
             scale_input = self.layer_norms[i](scale_input)
-            
-            # Prepare for causal convolution
-            conv_input = scale_input.transpose(1, 2)  # [batch_size, d_model, sequence_length]
-            conv_input = self._apply_causal_padding(conv_input, self.causal_convs[i])
-            
-            # Apply causal convolution
-            conv_out = self.causal_convs[i](conv_input)
-            conv_out = conv_out.transpose(1, 2)  # [batch_size, sequence_length, d_model]
-            
-            # Apply token connection with causal masking
-            connected_out = self.token_connectors[i](conv_out, causal_mask)
-            
+
+            # Apply causal convolutions
+            if use_convolutions:
+                conv_input = scale_input.transpose(1, 2)  # [B, d_model, L]
+                conv_input = self._apply_causal_padding(conv_input, self.causal_convs[i][0])
+
+                conv_outputs = [conv(conv_input) for conv in self.causal_convs[i]]
+                conv_out = torch.stack(conv_outputs, dim=2)  # [B, d_model, L, num_convs]
+                conv_out, _ = torch.max(conv_out, dim=2)  # [B, d_model, L]
+                conv_out = conv_out.transpose(1, 2)  # [B, L, d_model]
+            else:
+                conv_out = scale_input
+
+            # Apply token connectors
+            if use_token_connectors:
+                connected_out = self.token_connectors[i](conv_out, causal_mask)
+            else:
+                connected_out = conv_out
+
             # Predict future context
-            pred_out = self.predictors[i](connected_out)
-            
-            # Combine current and predicted features with residual connection
-            scale_out = connected_out + 0.1 * pred_out + scale_input
-            
-            # Progressive mixing of scales
-            if outputs:
+            if use_predictors:
+                pred_out = self.predictors[i](connected_out)
+                scale_out = connected_out + 0.1 * pred_out + scale_input
+            else:
+                scale_out = connected_out + scale_input
+
+            # Scale mixing
+            if use_scale_mixer and outputs:
                 prev_scales = torch.cat([*outputs, scale_out], dim=-1)
                 scale_out = self.scale_mixer[i](prev_scales)
-            
+
             outputs.append(scale_out)
             current_features = scale_out
-        
-        # Final output projection to vocabulary size
-        logits = self.output_layer(outputs[-1])
-        
-        return logits  # shape: [batch_size, sequence_length, vocab_size]
+
+        # Final output projection
+        logits = self.output_layer(outputs[-1])  # [B, L, vocab_size]
+        return logits
+
 
 
 
 
 class WikiSequentialDataset(Dataset):
-    def __init__(self, tokenizer, split="train", sequence_length=128,test_size=None):
+    def __init__(self, tokenizer, split="train", sequence_length=128,max_rows=None,build_tokenizer=True):
         self.tokenizer = tokenizer
         self.sequence_length = sequence_length
-        self.test_size = test_size
+        self.max_rows = max_rows
         self.dataset_vocab = Counter()  # To count token occurrences
         # Load dataset
-        dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
-        
+        dataset = load_dataset("wikitext", "wikitext-103-raw-v1", split=split)
+        # Limit the dataset to the first max_rows if specified
+        if max_rows:
+            dataset = dataset.select(range(min(max_rows, len(dataset))))
         # Process text in chunks
         self.sequences = []
         chunk_size = 100000
-        
+        # text cleaning specific to the wikitext dataset but should not really impact other datasets:
         full_text = " ".join([text.strip() for text in dataset["text"] if text.strip()])
         # Step 1: Replace " @" with ""
         full_text = full_text.replace(" @", "")
@@ -234,22 +264,31 @@ class WikiSequentialDataset(Dataset):
         # Step 3: Remove all remaining "@" symbols
         full_text = full_text.replace("@", "")
         
-        if test_size:
-            full_text = full_text[0:test_size]
+        if build_tokenizer:
+            # Build a tokenizer
+            tokenizer = tokenizer.train_new_from_iterator([full_text], 10000)
+            tokenizer.save_pretrained("custom-tokenizer")
+            self.tokenizer = tokenizer
+        
+        # Build dataset_vocab and prepare sequences
+        self.dataset_vocab = Counter()
+        self.sequences = []
+
         # Tokenize and build vocabulary
+        chunk_size = 100000
         for i in range(0, len(full_text), chunk_size):
             chunk = full_text[i:i + chunk_size]
-            tokens = self.tokenizer(chunk, return_tensors="pt", add_special_tokens=True)["input_ids"][0]
-            self.dataset_vocab.update(tokens.tolist())
-            
+            tokens = tokenizer.encode(chunk)  # Get the token IDs as a list
+            self.dataset_vocab.update(tokens)
+
             for j in range(0, len(tokens) - sequence_length - 1, sequence_length):
                 input_sequence = tokens[j:j + sequence_length]
                 target_sequence = tokens[j + 1:j + sequence_length + 1]
                 if len(input_sequence) == sequence_length and len(target_sequence) == sequence_length:
                     self.sequences.append((input_sequence, target_sequence))
-        
+
         print(f"Created {len(self.sequences)} sequences of length {sequence_length}")
-        print(f"Vocabulary reduced to {len(self.dataset_vocab)} tokens from original {len(tokenizer)}")
+        print(f"Vocabulary in dataset: {len(self.dataset_vocab)}")
 
 
     def __len__(self):
@@ -258,31 +297,17 @@ class WikiSequentialDataset(Dataset):
     def __getitem__(self, idx):
         input_ids, target_ids = self.sequences[idx]
         return {
-            "input_ids": input_ids,
-            "labels": target_ids
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "labels": torch.tensor(target_ids, dtype=torch.long)
         }
 
-def reduce_tokenizer_vocab(tokenizer, dataset_vocab):
-    # Filter out tokens not in the dataset vocabulary
-    filtered_vocab = {k: v for k, v in tokenizer.get_vocab().items() if v in dataset_vocab}
-    # Create a new directory to save the reduced vocabulary and config
-    vocab_dir = Path("reduced_tokenizer")
-    vocab_dir.mkdir(exist_ok=True)
-    # Save the filtered vocabulary as a JSON file
-    vocab_file_path = vocab_dir / "vocab.json"
-    with open(vocab_file_path, "w") as vocab_file:
-        json.dump(filtered_vocab, vocab_file)
-    # Copy the tokenizer config files to the new directory
-    tokenizer.save_pretrained(vocab_dir)
-
-    # Load the tokenizer from the newly created directory
-    reduced_tokenizer = AutoTokenizer.from_pretrained(vocab_dir,
-        vocab_size=len(filtered_vocab))
-    print(f'size of tokenizer vocab is now: {len(reduced_tokenizer)}')
-    return reduced_tokenizer
 
 
-def generate_sample(model, tokenizer, input_ids, device, max_new_tokens=50, beam_width=5, temperature=0.7, diverse_penalty=0.5, contrastive_penalty=0.1):
+
+def generate_sample(
+    model, tokenizer, input_ids, device, max_new_tokens=50, beam_width=2,
+    temperature=0.7, diverse_penalty=0.5, contrastive_penalty=0.1, max_input_length=128
+):
     model.eval()
     with torch.no_grad():
         # Initialize beams
@@ -293,6 +318,10 @@ def generate_sample(model, tokenizer, input_ids, device, max_new_tokens=50, beam
             
             # Expand each beam
             for seq, score in beams:
+                # Ensure the input sequence adheres to the max_input_length
+                if seq.shape[1] > max_input_length:
+                    seq = seq[:, -max_input_length:]  # Keep the last `max_input_length` tokens
+                
                 # Get logits for the next token
                 outputs = model(seq)
                 next_token_logits = outputs[:, -1, :]
@@ -346,8 +375,7 @@ def log_samples(model, batch, tokenizer, device, step):
     
     for i in range(min(3, len(batch["input_ids"]))):
         # Get input text
-        input_text = tokenizer.decode(batch["input_ids"][i], skip_special_tokens=True)
-        
+        input_text = tokenizer.decode(batch["input_ids"][i].tolist(), skip_special_tokens=True)
         # Generate continuation
         continuation = generate_sample(
             model, 
@@ -358,11 +386,14 @@ def log_samples(model, batch, tokenizer, device, step):
         
         # Get predictions and targets
         predictions = torch.argmax(logits[i], dim=-1)
+        # Squeeze the predictions tensor to remove batch dimension if it's size 1
+        predictions = predictions.squeeze(0)  # Now predictions should have shape (seq_length,)
         targets = batch["labels"][i]
         
-        # Collect the full predictions and corresponding targets
-        pred_text = tokenizer.decode(predictions, skip_special_tokens=True)
-        target_text = tokenizer.decode(targets, skip_special_tokens=True)
+        
+        # Decode predictions
+        pred_text = tokenizer.decode(predictions.tolist(), skip_special_tokens=True)
+        target_text = tokenizer.decode(targets.tolist(), skip_special_tokens=True)
         
         samples.append({
             "step": step,
@@ -409,23 +440,50 @@ class Trainer:
         self.best_val_loss = float('inf')
         self.last_save_time = datetime.now()
     
-    def compute_loss(self, logits, labels, reduction_penalty=0.1):
-        # Shape: [batch_size, sequence_length, vocab_size]
-        batch_size, sequence_length, vocab_size = logits.shape
-        
-        # Compute cross entropy loss
-        loss = F.cross_entropy(
-            logits.view(-1, vocab_size),
-            labels.view(-1),
-            reduction='none'
-        ).view(batch_size, sequence_length)
-        
-        # Apply exponential weight decay across sequence
-        pos_weights = torch.exp(torch.linspace(0, reduction_penalty, sequence_length)).to(logits.device)
-        weighted_loss = loss * pos_weights
-        
-        return weighted_loss.mean()
+
+    def compute_loss(
+        self, logits, labels, label_smoothing=0.1, repetition_penalty=1.2, coverage_weight=0.5
+    ):
+        """
+        Compute loss for language modeling, including cross-entropy, repetition, and coverage penalties.
     
+        Args:
+            logits: Predicted logits from the model (batch_size, seq_len, vocab_size).
+            labels: Ground truth token IDs (batch_size, seq_len).
+            label_smoothing: Smoothing for cross-entropy loss (default=0.1).
+            repetition_penalty: Penalize repeated predictions (default=1.2).
+            coverage_weight: Weight for encouraging diverse token coverage (default=0.5).
+    
+        Returns:
+            Combined loss (scalar).
+        """
+        batch_size, sequence_length, vocab_size = logits.shape
+    
+        # Reshape logits and labels for loss computation
+        logits = logits.view(-1, vocab_size)  # Shape: [batch_size*seq_len, vocab_size]
+        labels = labels.view(-1)  # Shape: [batch_size*seq_len]
+    
+        # Cross-entropy loss with label smoothing
+        ce_loss = F.cross_entropy(
+            logits, labels, ignore_index=-100, label_smoothing=label_smoothing
+        )
+    
+        # Repetition penalty - discourage repeated predictions in logits
+        probs = F.softmax(logits, dim=-1)  # Shape: [batch_size*seq_len, vocab_size]
+        top_probs, _ = probs.topk(1, dim=-1)  # Top predicted probabilities, shape: [batch_size*seq_len, 1]
+        repeated_penalty = (top_probs ** 2).mean()  # Penalize highly repeated predictions
+        repetition_loss = repetition_penalty * repeated_penalty
+    
+        # Coverage loss - encourage predictions to align with true labels
+        one_hot_labels = F.one_hot(labels, num_classes=vocab_size).float()  # Shape: [batch_size*seq_len, vocab_size]
+        coverage_loss = coverage_weight * torch.sum(probs * one_hot_labels) / labels.size(0)
+    
+        # Combine losses
+        combined_loss = ce_loss + repetition_loss - coverage_loss  # Coverage as reward (-ve loss)
+    
+        return combined_loss
+
+
     def validate(self):
         print("Starting validation...")
         self.model.eval()
@@ -468,6 +526,7 @@ class Trainer:
 
     def train(self):
         self.model.train()
+        print(f'tokenizer size = {tokenizer.vocab_size}')
         epoch = 0
         pbar = tqdm(total=self.config["total_steps"], desc=f"Training Epoch {epoch}")
         print("Starting training...")
@@ -500,17 +559,16 @@ class Trainer:
                 })
                 
                 # Validation and checkpointing
-                if self.step % self.config["eval_steps"] == 0:
+                if self.step > 0 and self.step % self.config["eval_steps"] == 0:
                     val_loss = self.validate()
                     wandb.log({"val_loss": val_loss, "step": self.step})
                     self.save_checkpoint(val_loss)
                     self.model.train()
                 
                 # Generate samples
-                if self.step % self.config["sample_steps"] == 0:
+                if self.step > 0 and self.step % self.config["sample_steps"] == 0:
                     log_samples(self.model, batch, self.tokenizer, self.device, self.step)
                     self.model.train()
-                
                 self.step += 1
                 pbar.update(1)
                 
@@ -519,20 +577,20 @@ class Trainer:
             
             pbar.set_description(f"Training Epoch {epoch}")
 
-def train_model(model_class, model_args):
+def train_model(model_class, model_args,model=None):
     # Initialize wandb
     run = wandb.init(project="neural-wave-models", name=f"{model_class.__name__}_experiment")
 
     # Training configuration
     config = {
         "batch_size": 32,
-        "learning_rate": 1e-4,
+        "learning_rate": 1.5e-3,
         "max_length": 128,
-        "total_steps": 10000,
+        "total_steps": 40000,
         "eval_steps": 500,
         "sample_steps": 100,
         "warmup_steps": 200,
-        #"test_size": 100000, ##token size
+        "max_rows": 300000, ##limit data size
         **model_args
     }
     wandb.config.update(config)
@@ -542,16 +600,31 @@ def train_model(model_class, model_args):
     save_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Initialize tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("microsoft/phi-3.5-mini-instruct")
+    # legacy - set as none as not impacting model
+    if not model: # if no model then build a tokenizer
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    else:
+        tokenizer = Tokenizer.from_file("custom_tokenizer/tokenizer.json")
+        tokenizer = PreTrainedTokenizerFast(tokenizer_object=tokenizer)
+        special_tokens_dict = {
+            'unk_token': '<|endoftext|>',
+            'bos_token': '<|endoftext|>',
+            'eos_token': '<|endoftext|>'
+        }
+        tokenizer.add_special_tokens(special_tokens_dict)
     
     # Create datasets
+    if not model: # if no model then build a tokenizer
+        train_dataset = WikiSequentialDataset(tokenizer, split="train", sequence_length=config["max_length"],
+                                        max_rows=config.get("max_rows", None))
+        tokenizer = train_dataset.tokenizer
+    else:
+        train_dataset = WikiSequentialDataset(tokenizer, split="train", sequence_length=config["max_length"],
+                                        max_rows=config.get("max_rows", None),build_tokenizer=False)
+    
     val_dataset = WikiSequentialDataset(tokenizer, split="validation", 
-                                      sequence_length=config["max_length"])
-    train_dataset = WikiSequentialDataset(tokenizer, split="train", 
-                                        test_size=config.get("test_size", None))
-    # Reduce tokenizer vocabulary
-    tokenizer = reduce_tokenizer_vocab(tokenizer, train_dataset.dataset_vocab)
+                                      sequence_length=config["max_length"],build_tokenizer=False)
+    
 
     
     # Create dataloaders
@@ -569,7 +642,8 @@ def train_model(model_class, model_args):
     )
     
     # Initialize model
-    model = model_class(**model_args, vocab_size=len(tokenizer)).to(device)
+    if not model:
+        model = model_class(**model_args, vocab_size=len(tokenizer.get_vocab())).to(device)
     
     # Setup optimizer and scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=config["learning_rate"])
@@ -577,7 +651,9 @@ def train_model(model_class, model_args):
         optimizer,
         max_lr=config["learning_rate"],
         total_steps=config["total_steps"],
-        pct_start=config["warmup_steps"] / config["total_steps"]
+        pct_start=config["warmup_steps"] / config["total_steps"],
+        div_factor=10,                           # Default: 25; reduces starting LR
+        final_div_factor=0.2                       # Default: 1e4; makes final LR less aggressive
     )
     
     # Create trainer and start training
@@ -638,20 +714,9 @@ def load_checkpoint(path, model, optimizer=None, scheduler=None, device='cuda'):
     # Set model to evaluation mode by default
     model.eval()
     
-    return model, optimizer, scheduler, checkpoint
+    return model, optimizer, scheduler, checkpoint, tokenizer
 
-####### FOR RUNNING THE BENCHMARK #########
-# For the Causal Fractal model
-fractal_model_args = {
-    "d_model": 256,
-    "depth": 4,
-    "window_size": 8
-}
-fractal_results = train_model(CausalFractalProcessor, fractal_model_args)
 
-model_args = {
-    "d_model": 256,  # Embedding dimension
-    "depth": 3      # Number of LSTM layers
-}
+#### TO TRAIN! ####
 
-results = train_model(LSTMProcessor, model_args)
+results = train_model(CausalFractalProcessor, fractal_model_args) #,model=model #add model to continue training...
